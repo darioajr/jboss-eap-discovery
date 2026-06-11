@@ -5,7 +5,7 @@
 
 Script Bash de inventário de instalações **JBoss EAP 6/7/8** (e WildFly) em servidores Linux. Descobre instalações, identifica modo de operação (standalone/domain), papel no domain (master/slave) e lista aplicações WAR/EAR declaradas e publicadas — tudo sem dependências externas.
 
-📖 Artigo com contexto e exemplos: [Inventariando JBoss EAP 6, 7 e 8 com Bash](https://openplatformvoices.com/inventariando-jboss-eap-6-7-e-8-com-bash-descobrindo-wars-ears-domain-standalone-master-e-68a5e9056308)
+📖 Artigo com contexto e exemplos: [Inventariando JBoss EAP 6, 7 e 8 com Bash: descobrindo WARs, EARs, Domain, Standalone, Master e Slave](https://openplatformvoices.com/inventariando-jboss-eap-6-7-e-8-com-bash-descobrindo-wars-ears-domain-standalone-master-e-68a5e9056308)
 
 ## Características
 
@@ -33,6 +33,9 @@ Script Bash de inventário de instalações **JBoss EAP 6/7/8** (e WildFly) em s
 
 # Diretórios de busca e profundidade customizados
 SEARCH_ROOTS="/opt /jboss /u01 /apps" MAXDEPTH=12 ./jboss-eap-discovery.sh
+
+# Inventário em larga escala: gere um JSON por servidor e consolide
+./jboss-eap-discovery.sh --json > jboss-inventory-$(hostname).json
 ```
 
 > Execute como `root` (ou usuário com permissão de leitura nos diretórios do JBoss) para resultados completos.
@@ -129,6 +132,15 @@ Regras de interpretação:
 - Em **domain**, aplicações em server-group são `DEPLOYED` quando `enabled="true"` ou sem `enabled="false"`.
 - Em **domain**, aplicações apenas no bloco top-level `<deployments>` aparecem como `DECLARED`.
 - Em `domain/data/content` o conteúdo é armazenado por hash, sem o nome original do WAR/EAR.
+
+## Casos de uso
+
+- Migração de JBoss EAP 6/7 para EAP 8;
+- Migração de JBoss EAP para OpenShift/Kubernetes;
+- Assessment de aplicações Java EE / Jakarta EE (ex.: preparação para o [Red Hat MTA](https://developers.redhat.com/products/mta/overview));
+- Inventário e organização de CMDB;
+- Auditoria de ambientes e identificação de aplicações órfãs;
+- Coleta em larga escala via Ansible/AWX/pipelines (saída `--json`).
 
 ## Limitações conhecidas
 
