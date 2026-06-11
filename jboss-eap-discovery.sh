@@ -4,7 +4,7 @@
 # JBoss EAP 6/7/8 Discovery Script
 # ==============================================================================
 #
-# Compatível com RHEL 6/7/8.
+# Compatível com RHEL 7/8/9.
 #
 # Não usa:
 # - jq
@@ -20,6 +20,11 @@
 #   JSON:
 #     ./jboss-eap-discovery.sh --json
 #
+# Limitações conhecidas:
+# - Caminhos (JBOSS_HOME, SEARCH_ROOTS) com espaços não são suportados.
+# - O parser de XML é linha a linha: tags <deployment> com atributos
+#   quebrados em múltiplas linhas não são detectadas.
+#
 # ==============================================================================
 
 set -u
@@ -34,9 +39,20 @@ for arg in "$@"; do
     --help|-h)
       echo "Uso: $0 [--json]"
       echo
-      echo "Variáveis opcionais:"
-      echo "  SEARCH_ROOTS=\"/opt /jboss /u01 /apps\""
-      echo "  MAXDEPTH=12"
+      echo "Opções:"
+      echo "  --json    Saída em JSON (padrão: texto)."
+      echo "  --help    Mostra esta ajuda."
+      echo
+      echo "Variáveis de ambiente opcionais:"
+      echo "  SEARCH_ROOTS  Diretórios raiz da busca (padrão: \"/opt /jboss /app /apps /srv /usr/local /home /u01\")."
+      echo "  MAXDEPTH      Profundidade máxima do find (padrão: 8)."
+      echo
+      echo "Exemplo:"
+      echo "  SEARCH_ROOTS=\"/opt /jboss /u01 /apps\" MAXDEPTH=12 $0 --json"
+      echo
+      echo "Códigos de saída:"
+      echo "  0  Pelo menos uma instalação encontrada."
+      echo "  1  Nenhuma instalação encontrada."
       exit 0
       ;;
   esac
@@ -45,13 +61,9 @@ done
 SEARCH_ROOTS="${SEARCH_ROOTS:-/opt /jboss /app /apps /srv /usr/local /home /u01}"
 MAXDEPTH="${MAXDEPTH:-8}"
 
-TMP_HOME="/tmp/jboss_eap_home_$$.tmp"
-TMP_DEPLOYED="/tmp/jboss_eap_deployed_$$.tmp"
-TMP_FOUND="/tmp/jboss_eap_found_$$.tmp"
-
-: > "$TMP_HOME"
-: > "$TMP_DEPLOYED"
-: > "$TMP_FOUND"
+TMP_HOME="$(mktemp /tmp/jboss_eap_home.XXXXXX)"
+TMP_DEPLOYED="$(mktemp /tmp/jboss_eap_deployed.XXXXXX)"
+TMP_FOUND="$(mktemp /tmp/jboss_eap_found.XXXXXX)"
 
 cleanup() {
   rm -f "$TMP_HOME" "$TMP_DEPLOYED" "$TMP_FOUND"
@@ -74,11 +86,17 @@ lower() {
 json_escape() {
   # Escape básico suficiente para caminhos, comandos e nomes comuns.
   # Não depende de jq/python/perl.
-  printf '%s' "$1" | sed \
-    -e 's/\\/\\\\/g' \
-    -e 's/"/\\"/g' \
-    -e 's/	/\\t/g' \
-    -e 's/\r/\\r/g'
+  printf '%s' "$1" | awk '
+    BEGIN { ORS = ""; first = 1 }
+    {
+      if (!first) print "\\n"
+      first = 0
+      gsub(/\\/, "\\\\")
+      gsub(/"/, "\\\"")
+      gsub(/\t/, "\\t")
+      gsub(/\r/, "\\r")
+      print
+    }'
 }
 
 json_string() {
@@ -101,16 +119,26 @@ get_os_fqdn() {
 }
 
 extract_arg_value() {
-  echo "$1" | sed -n "s#.*$2\([^ ]*\).*#\1#p" | head -n 1
+  # Procura o primeiro argumento que começa com o prefixo e devolve o
+  # restante. Comparação literal: prefixos e valores com caracteres
+  # especiais de regex não causam problema.
+  echo "$1" | awk -v p="$2" '{
+    for (i = 1; i <= NF; i++) {
+      if (index($i, p) == 1) {
+        print substr($i, length(p) + 1)
+        exit
+      }
+    }
+  }'
 }
 
 get_process_host_name() {
   args="$1"
 
-  host_name="$(echo "$args" | sed -n 's#.*-Djboss.host.name=\([^ ]*\).*#\1#p' | head -n 1)"
+  host_name="$(extract_arg_value "$args" "-Djboss.host.name=")"
 
   if [ -z "$host_name" ]; then
-    host_name="$(echo "$args" | sed -n 's#.*-Djboss.qualified.host.name=\([^ ]*\).*#\1#p' | head -n 1)"
+    host_name="$(extract_arg_value "$args" "-Djboss.qualified.host.name=")"
   fi
 
   echo "$host_name"
@@ -145,8 +173,8 @@ discover_from_processes() {
       mode="domain"
     fi
 
-    server_config="$(echo "$args" | sed -n 's#.*--server-config=\([^ ]*\).*#\1#p' | head -n 1)"
-    host_config="$(echo "$args" | sed -n 's#.*--host-config=\([^ ]*\).*#\1#p' | head -n 1)"
+    server_config="$(extract_arg_value "$args" "--server-config=")"
+    host_config="$(extract_arg_value "$args" "--host-config=")"
     process_host_name="$(get_process_host_name "$args")"
 
     if [ -n "$home" ] && [ -d "$home" ]; then
@@ -387,7 +415,21 @@ extract_attr() {
   line="$1"
   attr="$2"
 
-  echo "$line" | sed -n "s/.*$attr=\"\([^\"]*\)\".*/\1/p" | head -n 1
+  # Exige separador antes do nome do atributo para não confundir
+  # name= com runtime-name= (sufixo em comum).
+  echo "$line" | sed -n "s/.*[[:space:]]$attr=\"\([^\"]*\)\".*/\1/p" | head -n 1
+}
+
+field1_matches() {
+  # Verifica se algum registro do arquivo tem o primeiro campo (separado
+  # por |) exatamente igual ao valor. Evita falso positivo por substring
+  # (ex.: app.war casando com myapp.war).
+  value="$1"
+  file="$2"
+
+  [ -f "$file" ] || return 1
+
+  awk -F'|' -v v="$value" '$1 == v { found = 1; exit } END { exit !found }' "$file"
 }
 
 collect_declared_apps_from_xml() {
@@ -481,7 +523,9 @@ collect_physical_apps() {
   : > "$TMP_FOUND"
 
   find "$home" \
-    \( -path "$home/.git" -o -path "$home/tmp" -o -path "$home/docs" \) -prune -o \
+    \( -path "$home/.git" -o -path "$home/tmp" -o -path "$home/docs" \
+       -o -path "$home/standalone/tmp" -o -path "$home/domain/tmp" \
+       -o -path "$home/domain/servers/*/tmp" \) -prune -o \
     \( \
       -type f -name "*.war" -o \
       -type d -name "*.war" -o \
@@ -502,13 +546,15 @@ collect_physical_apps() {
 is_declared_app() {
   app_name="$1"
 
-  grep -Fq "$app_name|" "$TMP_DEPLOYED" 2>/dev/null
+  field1_matches "$app_name" "$TMP_DEPLOYED"
 }
 
 get_declared_status() {
   app_name="$1"
 
-  grep -F "$app_name|" "$TMP_DEPLOYED" 2>/dev/null | head -n 1 | cut -d'|' -f3
+  [ -f "$TMP_DEPLOYED" ] || return 0
+
+  awk -F'|' -v v="$app_name" '$1 == v { print $3; exit }' "$TMP_DEPLOYED"
 }
 
 get_final_physical_status() {
@@ -549,7 +595,7 @@ get_processes_for_home_json() {
 
   printf '['
 
-  ps -eo pid=,args= 2>/dev/null | grep "$home" | grep -v grep |
+  ps -eo pid=,args= 2>/dev/null | grep -F "$home" | grep -v grep |
   while read -r line; do
     pid="$(echo "$line" | awk '{print $1}')"
     args="$(echo "$line" | cut -d' ' -f2- | sed 's/[[:space:]][[:space:]]*/ /g')"
@@ -570,17 +616,11 @@ get_processes_for_home_json() {
 get_deployment_dirs_json() {
   home="$1"
 
-  candidates="
-$home/standalone/deployments
-$home/domain/deployments
-$home/domain/data/content
-"
-
   first="yes"
 
   printf '['
 
-  echo "$candidates" | while read -r d; do
+  for d in "$home/standalone/deployments" "$home/domain/deployments" "$home/domain/data/content"; do
     [ -d "$d" ] || continue
 
     [ "$first" = "no" ] && printf ','
@@ -664,7 +704,7 @@ get_missing_declared_json() {
 
   if [ -s "$TMP_DEPLOYED" ]; then
     while IFS='|' read -r app runtime status source_type source_file scope; do
-      if ! grep -Fq "$app|" "$TMP_FOUND" 2>/dev/null; then
+      if ! field1_matches "$app" "$TMP_FOUND"; then
         ext="${app##*.}"
         ext="$(lower "$ext")"
 
@@ -696,14 +736,14 @@ print_processes_for_home_text() {
 
   echo "Processos relacionados:"
 
-  count="$(ps -eo pid=,args= 2>/dev/null | grep "$home" | grep -v grep | wc -l | awk '{print $1}')"
+  count="$(ps -eo pid=,args= 2>/dev/null | grep -F "$home" | grep -v grep | wc -l | awk '{print $1}')"
 
   if [ "$count" = "0" ]; then
     echo "  - Nenhum processo rodando encontrado para este JBOSS_HOME."
     return
   fi
 
-  ps -eo pid=,args= 2>/dev/null | grep "$home" | grep -v grep |
+  ps -eo pid=,args= 2>/dev/null | grep -F "$home" | grep -v grep |
   while read -r line; do
     echo "  - PID $(echo "$line" | awk '{print $1}')"
     echo "    $(echo "$line" | cut -d' ' -f2- | sed 's/[[:space:]][[:space:]]*/ /g' | cut -c1-220)"
@@ -715,20 +755,18 @@ list_deployment_dirs_text() {
 
   echo "Diretórios prováveis de deployment:"
 
-  candidates="
-$home/standalone/deployments
-$home/domain/deployments
-$home/domain/data/content
-"
-
   found="no"
 
-  echo "$candidates" | while read -r d; do
+  for d in "$home/standalone/deployments" "$home/domain/deployments" "$home/domain/data/content"; do
     if [ -d "$d" ]; then
       found="yes"
       echo "  - $d"
     fi
   done
+
+  if [ "$found" = "no" ]; then
+    echo "  - Nenhum diretório de deployment encontrado."
+  fi
 }
 
 print_apps_report_text() {
@@ -778,7 +816,7 @@ print_apps_report_text() {
 
   if [ -s "$TMP_DEPLOYED" ]; then
     while IFS='|' read -r app runtime status source_type source_file scope; do
-      if ! grep -Fq "$app|" "$TMP_FOUND" 2>/dev/null; then
+      if ! field1_matches "$app" "$TMP_FOUND"; then
         missing="yes"
         ext="${app##*.}"
         ext="$(lower "$ext")"
@@ -807,7 +845,7 @@ print_text_output() {
   echo
 
   for home in $homes; do
-    records="$(grep "^$home|" "$TMP_HOME")"
+    records="$(awk -F'|' -v h="$home" '$1 == h' "$TMP_HOME")"
 
     first_record="$(echo "$records" | head -n 1)"
     source="$(echo "$first_record" | cut -d'|' -f2)"
@@ -921,7 +959,7 @@ print_json_output() {
   first_home="yes"
 
   for home in $homes; do
-    records="$(grep "^$home|" "$TMP_HOME")"
+    records="$(awk -F'|' -v h="$home" '$1 == h' "$TMP_HOME")"
 
     first_record="$(echo "$records" | head -n 1)"
     source="$(echo "$first_record" | cut -d'|' -f2)"
